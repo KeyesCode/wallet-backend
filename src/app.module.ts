@@ -18,10 +18,19 @@ import { memoryStore } from "cache-manager";
         limit: 60, // 60 requests per minute per IP
       },
     ]),
-    CacheModule.register({
-      store: memoryStore,
-      ttl: 60, // 60 seconds default
-      max: 1000, // max 1000 items in cache
+    CacheModule.registerAsync({
+      isGlobal: true,
+      useFactory: async () => {
+        const store = await memoryStore({
+          max: 1000,
+          ttl: 60 * 1000, // milliseconds
+        });
+        return {
+          store: store,
+          ttl: 60, // 60 seconds default
+          max: 1000, // max 1000 items in cache
+        };
+      },
     }),
   ],
   controllers: [EvmController],
