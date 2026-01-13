@@ -213,12 +213,6 @@ export class EvmService {
         if (value === "" || value === ".") {
           value = "0";
         }
-        // Debug log for small values
-        if (parseFloat(value) < 0.01 && value !== "0") {
-          this.logger.debug(
-            `ERC20 value conversion: rawValue=${transfer.rawContract?.value}, decimals=${decimals}, result=${value}`
-          );
-        }
       }
       
       tokenAddress = transfer.rawContract?.address?.toLowerCase();
@@ -446,22 +440,6 @@ export class EvmService {
       this.logger.log(
         `Fetched ${result.items.length} transactions for ${chainId}:${address} (${latency}ms)`
       );
-
-      // Log transaction values for debugging
-      result.items.forEach((item, index) => {
-        if (item.assetType === 'erc20' || item.assetType === 'native') {
-          this.logger.debug(
-            `Tx[${index}]: ${item.hash.substring(0, 10)}... | ${item.direction} | ${item.value} ${item.symbol} | assetType: ${item.assetType}`
-          );
-        }
-      });
-
-      // Log full response for first few items
-      if (result.items.length > 0) {
-        this.logger.debug(
-          `Sending to frontend - First transaction: ${JSON.stringify(result.items[0], null, 2)}`
-        );
-      }
 
       return result;
     } catch (error: any) {
