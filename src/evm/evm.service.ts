@@ -194,7 +194,7 @@ export class EvmService {
       const rawValue = transfer.rawContract?.value
         ? BigInt(transfer.rawContract.value)
         : BigInt(0);
-      
+
       // Convert BigInt to decimal string with proper precision
       const rawValueStr = rawValue.toString();
       if (rawValueStr === "0") {
@@ -214,7 +214,7 @@ export class EvmService {
           value = "0";
         }
       }
-      
+
       tokenAddress = transfer.rawContract?.address?.toLowerCase();
       symbol = transfer.asset || "TOKEN";
     } else if (
@@ -397,12 +397,14 @@ export class EvmService {
             try {
               outboundJson = await outboundResponse.json();
             } catch (e: any) {
-              const errorText = await outboundResponse.text().catch(() => "Unknown error");
+              const errorText = await outboundResponse
+                .text()
+                .catch(() => "Unknown error");
               this.logger.warn(
                 `Alchemy outbound JSON parse error: ${errorText}`
               );
             }
-            
+
             if (outboundJson && !outboundJson.error && outboundJson.result) {
               const outboundData: AlchemyResponse = outboundJson.result;
               const outboundItems: TxItem[] = outboundData.transfers.map(
@@ -452,6 +454,106 @@ export class EvmService {
       }
       throw new BadRequestException(
         `Failed to fetch transaction history: ${error.message}`
+      );
+    }
+  }
+
+  async proxyRpcCall(
+    chainId: number,
+    method: string,
+    params: any[]
+  ): Promise<any> {
+    const startTime = Date.now();
+
+    if (!this.chainIdToKey[chainId]) {
+      throw new BadRequestException(`Unsupported chainId: ${chainId}`);
+    }
+
+    const alchemyUrl = this.getAlchemyUrl(chainId);
+
+    this.logger.log(`Proxying RPC call: ${method} for chainId ${chainId}`);
+
+    try {
+      const response = await fetch(alchemyUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method,
+          params,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        this.logger.error(
+          `Alchemy RPC HTTP error for ${method} on ${chainId}: ${response.status} ${errorText}`
+        );
+        throw new BadRequestException(
+          `Alchemy API HTTP error: ${response.status} - ${errorText.substring(
+            0,
+            200
+          )}`
+        );
+      }
+
+      // Read response as text first so we can retry parsing if needed
+      const responseText = await response.text();
+
+      // Check content-type before parsing
+      const contentType = response.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        this.logger.error(
+          `Alchemy RPC returned non-JSON response for ${method} on ${chainId}: ${contentType} - ${responseText.substring(
+            0,
+            200
+          )}`
+        );
+        throw new BadRequestException(
+          `Alchemy API returned non-JSON response: ${contentType}`
+        );
+      }
+
+      let json;
+      try {
+        json = JSON.parse(responseText);
+      } catch (parseError: any) {
+        this.logger.error(
+          `Alchemy RPC JSON parse error for ${method} on ${chainId}: ${
+            parseError.message
+          } - ${responseText.substring(0, 200)}`
+        );
+        throw new BadRequestException(
+          `Alchemy API returned invalid JSON: ${parseError.message}`
+        );
+      }
+
+      if (json.error) {
+        this.logger.error(
+          `Alchemy RPC error for ${method} on ${chainId}: ${json.error.message}`
+        );
+        throw new BadRequestException(
+          `Alchemy API error: ${json.error.message}`
+        );
+      }
+
+      const latency = Date.now() - startTime;
+      this.logger.log(
+        `RPC call ${method} for chainId ${chainId} completed in ${latency}ms`
+      );
+
+      return json.result;
+    } catch (error: any) {
+      this.logger.error(
+        `Error proxying RPC call ${method} for chainId ${chainId}: ${error.message}`,
+        error.stack
+      );
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      throw new BadRequestException(
+        `Failed to proxy RPC call: ${error.message}`
       );
     }
   }
