@@ -153,11 +153,38 @@ export class EvmService {
 
     if (transfer.category === "external") {
       // Native token transfer
-      value = transfer.value
-        ? (transfer.value / 1e18).toFixed(18)
-        : transfer.rawContract?.value
-        ? (parseInt(transfer.rawContract.value, 16) / 1e18).toFixed(18)
-        : "0";
+      // Alchemy's transfer.value is already in decimal (ETH), but rawContract.value is in wei (hex)
+      // Prefer rawContract.value for precision, but fall back to transfer.value
+      if (transfer.rawContract?.value) {
+        // Convert hex wei to decimal string
+        const rawValue = BigInt(transfer.rawContract.value);
+        const rawValueStr = rawValue.toString();
+        if (rawValueStr === "0") {
+          value = "0";
+        } else {
+          const decimals = 18; // Native tokens always use 18 decimals
+          const padded = rawValueStr.padStart(decimals + 1, "0");
+          const splitIndex = padded.length - decimals;
+          const integerPart = padded.slice(0, splitIndex) || "0";
+          const fractionalPart = padded.slice(splitIndex);
+          value = `${integerPart}.${fractionalPart}`;
+          // Remove trailing zeros
+          value = value.replace(/\.?0+$/, "");
+          if (value === "" || value === ".") {
+            value = "0";
+          }
+        }
+      } else if (transfer.value) {
+        // Fallback: transfer.value is already in ETH (decimal), just format it
+        value = transfer.value.toString();
+        // Remove unnecessary trailing zeros
+        value = value.replace(/\.?0+$/, "");
+        if (value === "" || value === ".") {
+          value = "0";
+        }
+      } else {
+        value = "0";
+      }
       symbol = "ETH"; // Could be chain-specific (ETH, MATIC, etc.)
     } else if (transfer.category === "erc20") {
       // ERC20 token
@@ -167,7 +194,33 @@ export class EvmService {
       const rawValue = transfer.rawContract?.value
         ? BigInt(transfer.rawContract.value)
         : BigInt(0);
-      value = (Number(rawValue) / Math.pow(10, decimals)).toFixed(decimals);
+      
+      // Convert BigInt to decimal string with proper precision
+      const rawValueStr = rawValue.toString();
+      if (rawValueStr === "0") {
+        value = "0";
+      } else {
+        // Pad with zeros on the left if the number is smaller than the decimal places
+        const padded = rawValueStr.padStart(decimals + 1, "0");
+        // Insert decimal point: take everything except last 'decimals' digits as integer part
+        const splitIndex = padded.length - decimals;
+        const integerPart = padded.slice(0, splitIndex) || "0";
+        const fractionalPart = padded.slice(splitIndex);
+        value = `${integerPart}.${fractionalPart}`;
+        // Remove trailing zeros but keep at least one digit after decimal if there's a decimal point
+        value = value.replace(/\.?0+$/, "");
+        // If we removed everything, it was zero
+        if (value === "" || value === ".") {
+          value = "0";
+        }
+        // Debug log for small values
+        if (parseFloat(value) < 0.01 && value !== "0") {
+          this.logger.debug(
+            `ERC20 value conversion: rawValue=${transfer.rawContract?.value}, decimals=${decimals}, result=${value}`
+          );
+        }
+      }
+      
       tokenAddress = transfer.rawContract?.address?.toLowerCase();
       symbol = transfer.asset || "TOKEN";
     } else if (
@@ -281,7 +334,29 @@ export class EvmService {
         }),
       });
 
-      const json = await response.json();
+      // Check if response is OK and is JSON
+      if (!response.ok) {
+        const errorText = await response.text();
+        this.logger.error(
+          `Alchemy HTTP error for ${chainId}:${address}: ${response.status} ${errorText}`
+        );
+        throw new BadRequestException(
+          `Alchemy API HTTP error: ${response.status}`
+        );
+      }
+
+      let json;
+      try {
+        json = await response.json();
+      } catch (e: any) {
+        const errorText = await response.text().catch(() => "Unknown error");
+        this.logger.error(
+          `Alchemy JSON parse error for ${chainId}:${address}: ${errorText}`
+        );
+        throw new BadRequestException(
+          `Alchemy API returned invalid JSON: ${errorText.substring(0, 100)}`
+        );
+      }
 
       if (json.error) {
         this.logger.error(
@@ -318,13 +393,29 @@ export class EvmService {
             }),
           });
 
-          const outboundJson = await outboundResponse.json();
-          if (!outboundJson.error && outboundJson.result) {
-            const outboundData: AlchemyResponse = outboundJson.result;
-            const outboundItems: TxItem[] = outboundData.transfers.map(
-              (transfer) => this.normalizeTransfer(transfer, chainId, address)
+          if (!outboundResponse.ok) {
+            const errorText = await outboundResponse.text();
+            this.logger.warn(
+              `Alchemy outbound HTTP error: ${outboundResponse.status} ${errorText}`
             );
-            items.push(...outboundItems);
+          } else {
+            let outboundJson;
+            try {
+              outboundJson = await outboundResponse.json();
+            } catch (e: any) {
+              const errorText = await outboundResponse.text().catch(() => "Unknown error");
+              this.logger.warn(
+                `Alchemy outbound JSON parse error: ${errorText}`
+              );
+            }
+            
+            if (outboundJson && !outboundJson.error && outboundJson.result) {
+              const outboundData: AlchemyResponse = outboundJson.result;
+              const outboundItems: TxItem[] = outboundData.transfers.map(
+                (transfer) => this.normalizeTransfer(transfer, chainId, address)
+              );
+              items.push(...outboundItems);
+            }
           }
         } catch (outboundError: any) {
           // Log but don't fail if outbound fetch fails
@@ -355,6 +446,22 @@ export class EvmService {
       this.logger.log(
         `Fetched ${result.items.length} transactions for ${chainId}:${address} (${latency}ms)`
       );
+
+      // Log transaction values for debugging
+      result.items.forEach((item, index) => {
+        if (item.assetType === 'erc20' || item.assetType === 'native') {
+          this.logger.debug(
+            `Tx[${index}]: ${item.hash.substring(0, 10)}... | ${item.direction} | ${item.value} ${item.symbol} | assetType: ${item.assetType}`
+          );
+        }
+      });
+
+      // Log full response for first few items
+      if (result.items.length > 0) {
+        this.logger.debug(
+          `Sending to frontend - First transaction: ${JSON.stringify(result.items[0], null, 2)}`
+        );
+      }
 
       return result;
     } catch (error: any) {
